@@ -1,4 +1,5 @@
 from warnings import warn
+from typing import List, Tuple
 
 import autograd.numpy as np
 import autograd.numpy.random as npr
@@ -742,6 +743,218 @@ class PoissonEmissions(_PoissonEmissionsMixin, _LinearEmissions):
 
         else:
             raise Exception("No Hessian calculation for link: {}".format(self.link_name))
+
+class MultiplePoissonEmissions(Emissions):
+    def __init__(self,
+                 N,
+                 K,
+                 D,
+                 M=0,
+                 single_subspace=True,
+                 **kwargs):
+
+        """
+        Fitting Poisson observations for different recording sessions. A method to align across days. One C matrix
+        per session.
+        """
+        super(MultiplePoissonEmissions, self).__init__(N, K, D, M=M, single_subspace=single_subspace)
+
+        if "session_ids" not in kwargs:
+            raise ValueError("MultiplePoissonEmissions requires session_ids to be provided.")
+            # validate session ids as a list of int
+        if not all(isinstance(session, int) for session in kwargs["session_ids"]):
+            raise ValueError("All session_ids must be an integer")
+
+        self._session_ids = np.array(kwargs["session_ids"])
+
+        # get the number of unique session ids
+        self._num_sessions = np.unique(self._session_ids).shape[0]
+        if self._num_sessions == 1:
+            raise ValueError("Only one unique session, use regular PoissonEmissions.")
+        # make multiple C matrices, one for each session
+        self._Cs = npr.randn(self._num_sessions, N, D) if single_subspace else npr.randn(K, N, D)
+        self.Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        self.ds = npr.randn(1, N) if single_subspace else npr.randn(K, N)
+
+        if "link" not in kwargs:
+            link = "softplus"
+        else:
+            link = kwargs["link"]
+        if "bin_size" not in kwargs:
+            bin_size = 1.0
+        else:
+            bin_size = kwargs["bin_size"]
+
+        self.link_name = link
+        self.bin_size = bin_size
+        mean_functions = dict(
+            log=self._log_mean,
+            softplus=self._softplus_mean
+        )
+        self.mean = mean_functions[link]
+        link_functions = dict(
+            log=self._log_link,
+            softplus=self._softplus_link
+        )
+        self.link = link_functions[link]
+
+    @property
+    def Cs(self):
+        return self._Cs
+
+    @Cs.setter
+    def Cs(self, value):
+        K, N, D = self.K, self.N, self.D
+        assert value.shape == (self._num_sessions, N, D) if self.single_subspace else (K, N, D)
+        self._Cs = value
+
+    @property
+    def num_sessions(self) -> int:
+        """Return number of sessions."""
+        return self._num_sessions
+
+    @property
+    def session_ids(self) -> List[int]:
+        """Return list of session ids."""
+        return self._session_ids
+
+    @property
+    def params(self):
+        return self.Cs, self.Fs, self.ds
+
+    @params.setter
+    def params(self, value):
+        self.Cs, self.Fs, self.ds = value
+
+    @ensure_args_are_lists
+    def initialize(self, datas, inputs=None, masks=None, tags=None):
+        datas = [interpolate_data(data, mask) for data, mask in zip(datas, masks)]
+        yhats = [self.link(np.clip(d, .1, np.inf)) for d in datas]
+        self._initialize_with_pca(yhats, inputs=inputs, masks=masks, tags=tags)
+
+    @ensure_args_are_lists
+    def _initialize_with_pca(self, datas, inputs=None, masks=None, tags=None, num_iters=20):
+        Keff = 1 if self.single_subspace else self.K
+
+        _Cs = list()
+        _ds = list()
+
+        # want to run this for each C
+        for i in range(self.num_sessions):
+            # get all the datas for that session id
+            idxs = np.where(self.session_ids == i)[0]
+            _datas = [datas[i] for i in idxs]
+            _inputs = [inputs[i] for i in idxs]
+            _masks = [masks[i] for i in idxs]
+
+            # First solve a linear regression for data given input
+            if self.M > 0:
+                from sklearn.linear_model import LinearRegression
+                lr = LinearRegression(fit_intercept=False)
+                lr.fit(np.vstack(_inputs), np.vstack(_datas))
+                self.Fs = np.tile(lr.coef_[None, :, :], (Keff, 1, 1))
+
+            # Compute residual after accounting for input
+            resids = [data - np.dot(input, self.Fs[0].T) for data, input in zip(_datas, _inputs)]
+
+            # Run PCA to get a linear embedding of the data with the maximum effective dimension
+            # need to also get masks for each trial
+            pca, xs, ll = pca_with_imputation(min(self.D * Keff, self.N),
+                                              resids, _masks, num_iters=num_iters)
+
+            # Assign each state a random projection of these dimensions
+            Cs, ds = [], []
+            for k in range(Keff):
+                weights = npr.randn(self.D, self.D * Keff)
+                weights = np.linalg.svd(weights, full_matrices=False)[2]
+                Cs.append((weights @ pca.components_).T)
+                ds.append(pca.mean_)
+            _Cs.append(np.array(Cs))
+            _ds.append(np.array(ds))
+
+        # Find the components with the largest power
+        self.Cs = np.vstack(_Cs)
+        self.ds = np.sum(_ds, axis=0)
+
+        return pca
+
+    def _log_mean(self, x):
+        return np.exp(x) * self.bin_size
+
+    def _softplus_mean(self, x):
+        return softplus(x) * self.bin_size
+
+    def _log_link(self, rate):
+        return np.log(rate) - np.log(self.bin_size)
+
+    def _softplus_link(self, rate):
+        return inv_softplus(rate / self.bin_size)
+
+    def log_likelihoods(self, data, input, mask, tag, x):
+        assert data.dtype == int
+        lambdas = self.mean(self.forward(x, input, tag))
+        mask = np.ones_like(data, dtype=bool) if mask is None else mask
+        lls = -gammaln(data[:,None,:] + 1) -lambdas + data[:,None,:] * np.log(lambdas)
+        return np.sum(lls * mask[:, None, :], axis=2)
+
+    def invert(self, data, input=None, mask=None, tag=None):
+        yhat = self.link(np.clip(data, .1, np.inf))
+        return self._invert(yhat, input=input, mask=mask, tag=tag)
+
+    def _invert(self, data, input=None, mask=None, tag=None):
+        """
+        Approximate invert the linear emission model with the pseudoinverse
+
+        y = Cx + d + noise; C orthogonal.
+        xhat = (C^T C)^{-1} C^T (y-d)
+        """
+        # Invert with the average emission parameters
+        C = np.mean(self.Cs, axis=0)
+        F = np.mean(self.Fs, axis=0)
+        d = np.mean(self.ds, axis=0)
+        C_pseudoinv = np.linalg.solve(C.T.dot(C), C.T).T
+
+        # Account for the bias
+        bias = input.dot(F.T) + d
+
+        if not np.all(mask):
+            data = interpolate_data(data, mask)
+            # We would like to find the PCA coordinates in the face of missing data
+            # To do so, alternate between running PCA and imputing the missing entries
+            for itr in range(25):
+                mu = (data - bias).dot(C_pseudoinv)
+                data[:, ~mask[0]] = (mu.dot(C.T) + bias)[:, ~mask[0]]
+
+        # Project data to get the mean
+        return (data - bias).dot(C_pseudoinv)
+
+    #
+    # def _invert(self, data, input=None, mask=None, tag=None):
+    #     """
+    #     Approximate invert the linear emission model with the pseudoinverse
+    #
+    #     y = Cx + d + noise; C orthogonal.
+    #     xhat = (C^T C)^{-1} C^T (y-d)
+    #     """
+    #     # Invert with the average emission parameters
+    #     C = np.mean(self.Cs, axis=0)
+    #     F = np.mean(self.Fs, axis=0)
+    #     d = np.mean(self.ds, axis=0)
+    #     C_pseudoinv = np.linalg.solve(C.T.dot(C), C.T).T
+    #
+    #     # Account for the bias
+    #     bias = input.dot(F.T) + d
+    #
+    #     if not np.all(mask):
+    #         data = interpolate_data(data, mask)
+    #         # We would like to find the PCA coordinates in the face of missing data
+    #         # To do so, alternate between running PCA and imputing the missing entries
+    #         for itr in range(25):
+    #             mu = (data - bias).dot(C_pseudoinv)
+    #             data[:, ~mask[0]] = (mu.dot(C.T) + bias)[:, ~mask[0]]
+    #
+    #     # Project data to get the mean
+    #     return (data - bias).dot(C_pseudoinv)
 
 
 class PoissonOrthogonalEmissions(_PoissonEmissionsMixin, _OrthogonalLinearEmissions):

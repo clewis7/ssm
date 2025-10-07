@@ -107,6 +107,7 @@ class SLDS(object):
             t_id=emssn.StudentsTIdentityEmissions,
             t_nn=emssn.StudentsTNeuralNetworkEmissions,
             poisson=emssn.PoissonEmissions,
+            multi_poisson=emssn.MultiplePoissonEmissions,
             poisson_orthog=emssn.PoissonOrthogonalEmissions,
             poisson_id=emssn.PoissonIdentityEmissions,
             poisson_nn=emssn.PoissonNeuralNetworkEmissions,
@@ -126,6 +127,9 @@ class SLDS(object):
 
         if isinstance(emissions, str):
             emissions = emissions.lower()
+            if emissions == "multi_poisson" and "session_ids" not in emission_kwargs.keys():
+                raise Exception("If fitting multiple sessions, session_ids must be provided.")
+
             if emissions not in emission_classes:
                 raise Exception("Invalid emission model: {}. Must be one of {}".
                     format(emissions, list(emission_classes.keys())))
