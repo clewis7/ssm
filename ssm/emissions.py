@@ -874,7 +874,7 @@ class MultiplePoissonEmissions(Emissions):
 
         # Find the components with the largest power
         self.Cs = np.vstack(_Cs)
-        self.ds = np.sum(_ds, axis=0)
+        self.ds = np.mean(_ds, axis=0)
 
         return pca
 
@@ -890,26 +890,27 @@ class MultiplePoissonEmissions(Emissions):
     def _softplus_link(self, rate):
         return inv_softplus(rate / self.bin_size)
 
-    def log_likelihoods(self, data, input, mask, tag, x):
+    def log_likelihoods(self, data, index, input, mask, tag, x):
         assert data.dtype == int
-        lambdas = self.mean(self.forward(x, input, tag))
+        lambdas = self.mean(self.forward(x, index, input, tag))
         mask = np.ones_like(data, dtype=bool) if mask is None else mask
         lls = -gammaln(data[:,None,:] + 1) -lambdas + data[:,None,:] * np.log(lambdas)
         return np.sum(lls * mask[:, None, :], axis=2)
 
-    def invert(self, data, input=None, mask=None, tag=None):
+    def invert(self, data, index, input=None, mask=None, tag=None):
         yhat = self.link(np.clip(data, .1, np.inf))
-        return self._invert(yhat, input=input, mask=mask, tag=tag)
+        return self._invert(yhat, index=index, input=input, mask=mask, tag=tag)
 
-    def _invert(self, data, input=None, mask=None, tag=None):
+    def _invert(self, data, index, input=None, mask=None, tag=None):
         """
         Approximate invert the linear emission model with the pseudoinverse
 
         y = Cx + d + noise; C orthogonal.
         xhat = (C^T C)^{-1} C^T (y-d)
         """
+        session_id = self.session_ids[index]
         # Invert with the average emission parameters
-        C = np.mean(self.Cs, axis=0)
+        C = np.mean(self.Cs[session_id].reshape(1, self.N, self.D), axis=0)
         F = np.mean(self.Fs, axis=0)
         d = np.mean(self.ds, axis=0)
         C_pseudoinv = np.linalg.solve(C.T.dot(C), C.T).T
@@ -928,33 +929,75 @@ class MultiplePoissonEmissions(Emissions):
         # Project data to get the mean
         return (data - bias).dot(C_pseudoinv)
 
-    #
-    # def _invert(self, data, input=None, mask=None, tag=None):
-    #     """
-    #     Approximate invert the linear emission model with the pseudoinverse
-    #
-    #     y = Cx + d + noise; C orthogonal.
-    #     xhat = (C^T C)^{-1} C^T (y-d)
-    #     """
-    #     # Invert with the average emission parameters
-    #     C = np.mean(self.Cs, axis=0)
-    #     F = np.mean(self.Fs, axis=0)
-    #     d = np.mean(self.ds, axis=0)
-    #     C_pseudoinv = np.linalg.solve(C.T.dot(C), C.T).T
-    #
-    #     # Account for the bias
-    #     bias = input.dot(F.T) + d
-    #
-    #     if not np.all(mask):
-    #         data = interpolate_data(data, mask)
-    #         # We would like to find the PCA coordinates in the face of missing data
-    #         # To do so, alternate between running PCA and imputing the missing entries
-    #         for itr in range(25):
-    #             mu = (data - bias).dot(C_pseudoinv)
-    #             data[:, ~mask[0]] = (mu.dot(C.T) + bias)[:, ~mask[0]]
-    #
-    #     # Project data to get the mean
-    #     return (data - bias).dot(C_pseudoinv)
+    def forward(self, x, index, input, tag):
+        session_id = self.session_ids[index]
+        C = self.Cs[session_id].reshape(1, self.N, self.D)
+        return np.matmul(C[None, ...], x[:, None, :, None])[:, :, :, 0] \
+            + np.matmul(self.Fs[None, ...], input[:, None, :, None])[:, :, :, 0] \
+            + self.ds
+
+    def neg_hessian_log_emissions_prob(self, data, ix, input, mask, tag, x, Ez):
+        """
+        d/dx log p(y | x) = d/dx [y * (Cx + Fu + d) - exp(Cx + Fu + d)
+                          = y * C - lmbda * C
+                          = (y - lmbda) * C
+
+        d/dx  (y - lmbda)^T C = d/dx -exp(Cx + Fu + d)^T C
+            = -C^T exp(Cx + Fu + d)^T C
+        """
+        if self.single_subspace is False:
+            raise Exception("Multiple subspaces are not supported for this Emissions class.")
+
+        session_id = self.session_ids[ix]
+        C = self.Cs[session_id]
+
+        if self.link_name == "log":
+            lambdas = self.mean(self.forward(x, input, tag))
+            hess = np.einsum('tn, ni, nj ->tij', -lambdas[:, 0, :], C[0], C[0])
+            return -1 * hess
+
+        elif self.link_name == "softplus":
+            # For stability, we avoid evaluating terms that look like exp(x)**2.
+            # Instead, we rearrange things so that all terms with exp(x)**2 are of the form
+            # (exp(x) / exp(x)**2) which evaluates to sigmoid(x)sigmoid(-x) and avoids overflow.
+            lambdas = self.mean(self.forward(x, ix, input, tag))[:, 0, :] / self.bin_size
+            linear_terms = -np.dot(x,C.T)-np.dot(input,self.Fs[0].T)-self.ds[0]
+            expterms = np.exp(linear_terms)
+            outer = logistic(linear_terms) * logistic(-linear_terms)
+            diags = outer * (data / lambdas - data / (lambdas**2 * expterms) - self.bin_size)
+            hess = np.einsum('tn, ni, nj ->tij', diags, C, C)
+            return -hess
+
+        else:
+            raise Exception("No Hessian calculation for link: {}".format(self.link_name))
+
+
+    def m_step(self, discrete_expectations, continuous_expectations,
+               datas, inputs, masks, tags,
+               optimizer="bfgs", maxiter=100, **kwargs):
+        """
+        If M-step in Laplace-EM cannot be done in closed form for the emissions, default to SGD.
+        """
+        optimizer = dict(adam=adam, bfgs=bfgs, lbfgs=lbfgs, rmsprop=rmsprop, sgd=sgd)[optimizer]
+
+        # expected log likelihood
+        T = sum([data.shape[0] for data in datas])
+        def _objective(params, itr):
+            self.params = params
+            obj = 0
+            obj += self.log_prior()
+            for ix, (data, input, mask, tag, x, (Ez, _, _))in \
+                enumerate(zip(datas, inputs, masks, tags, continuous_expectations, discrete_expectations)):
+                obj += np.sum(Ez * self.log_likelihoods(data, ix, input, mask, tag, x))
+            return -obj / T
+
+        # Optimize emissions log-likelihood
+        self.params = optimizer(_objective, self.params,
+                                num_iters=maxiter,
+                                suppress_warnings=True,
+                                **kwargs)
+
+
 
 
 class PoissonOrthogonalEmissions(_PoissonEmissionsMixin, _OrthogonalLinearEmissions):

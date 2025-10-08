@@ -6,6 +6,7 @@ import autograd.numpy as np
 import autograd.numpy.random as npr
 from autograd import value_and_grad, grad
 
+import ssm.emissions
 from ssm.optimizers import adam_step, rmsprop_step, sgd_step, lbfgs, \
     convex_combination, newtons_method_block_tridiag_hessian
 from ssm.primitives import hmm_normalizer
@@ -171,8 +172,12 @@ class SLDS(object):
         self.emissions.initialize(datas, inputs, masks, tags)
 
         # Get the initialized variational mean for the data
-        xs = [self.emissions.invert(data, input, mask, tag)
-              for data, input, mask, tag in zip(datas, inputs, masks, tags)]
+        if isinstance(self.emissions, ssm.emissions.MultiplePoissonEmissions):
+            xs = [self.emissions.invert(data=data, index=ix, input=input, mask=mask, tag=tag)
+                  for ix, (data, input, mask, tag) in enumerate(zip(datas, inputs, masks, tags))]
+        else:
+            xs = [self.emissions.invert(data, input, mask, tag)
+                 for data, input, mask, tag in zip(datas, inputs, masks, tags)]
         xmasks = [np.ones_like(x, dtype=bool) for x in xs]
 
         # Number of times to run the arhmm initialization (we'll use the one with the highest log probability as the initialization)
@@ -434,6 +439,7 @@ class SLDS(object):
     # Compute the expected log joint
     def _laplace_neg_expected_log_joint(self,
                                         data,
+                                        ix,
                                         input,
                                         mask,
                                         tag,
@@ -447,7 +453,10 @@ class SLDS(object):
         log_Ps = self.transitions.\
             log_transition_matrices(x, input, x_mask, tag)
         log_likes = self.dynamics.log_likelihoods(x, input, x_mask, tag)
-        log_likes += self.emissions.log_likelihoods(data, input, mask, tag, x)
+        if isinstance(self.emissions, ssm.emissions.MultiplePoissonEmissions):
+            log_likes += self.emissions.log_likelihoods(data, ix, input, mask, tag, x)
+        else:
+            log_likes += self.emissions.log_likelihoods(data, input, mask, tag, x)
 
         # Compute the expected log probability
         elp = np.sum(Ez[0] * log_pi0)
@@ -457,7 +466,7 @@ class SLDS(object):
         return -1 * elp / scale
 
     # We also need the hessian of the of the expected log joint
-    def _laplace_neg_hessian_params(self, data, input, mask, tag, x, Ez, Ezzp1):
+    def _laplace_neg_hessian_params(self, data, ix, input, mask, tag, x, Ez, Ezzp1):
         T, D = np.shape(x)
         x_mask = np.ones((T, D), dtype=bool)
 
@@ -467,14 +476,18 @@ class SLDS(object):
             neg_hessian_expected_log_trans_prob(x, input, x_mask, tag, Ezzp1)
         J_dyn_11 += J_transitions
 
-        J_obs = self.emissions.\
-            neg_hessian_log_emissions_prob(data, input, mask, tag, x, Ez)
+        if isinstance(self.emissions, ssm.emissions.MultiplePoissonEmissions):
+            J_obs = self.emissions. \
+                neg_hessian_log_emissions_prob(data, ix, input, mask, tag, x, Ez)
+        else:
+            J_obs = self.emissions.\
+                neg_hessian_log_emissions_prob(data, input, mask, tag, x, Ez)
 
         return J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs
 
-    def _laplace_hessian_neg_expected_log_joint(self, data, input, mask, tag, x, Ez, Ezzp1, scale=1):
+    def _laplace_hessian_neg_expected_log_joint(self, data, ix, input, mask, tag, x, Ez, Ezzp1, scale=1):
         J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs = \
-            self._laplace_neg_hessian_params(data, input, mask, tag, x, Ez, Ezzp1)
+            self._laplace_neg_hessian_params(data, ix, input, mask, tag, x, Ez, Ezzp1)
 
         hessian_diag = np.zeros_like(J_obs)
         hessian_diag[:] += J_obs
@@ -527,16 +540,16 @@ class SLDS(object):
         # for q(x).
         continuous_state_params = []
         x0s = variational_posterior.mean_continuous_states
-        for (Ez, Ezzp1, _), x0, data, input, mask, tag in \
-            zip(variational_posterior.discrete_expectations,
-                x0s, datas, inputs, masks, tags):
+        for ix, ((Ez, Ezzp1, _), x0, data, input, mask, tag) in \
+            enumerate(zip(variational_posterior.discrete_expectations,
+                x0s, datas, inputs, masks, tags)):
 
             # Use Newton's method or LBFGS to find the argmax of the expected log joint
             scale = x0.size
-            kwargs = dict(data=data, input=input, mask=mask, tag=tag, Ez=Ez, Ezzp1=Ezzp1, scale=scale)
+            kwargs = dict(data=data, ix=ix, input=input, mask=mask, tag=tag, Ez=Ez, Ezzp1=Ezzp1, scale=scale)
 
             def _objective(x, iter): return self._laplace_neg_expected_log_joint(x=x, **kwargs)
-            def _grad_obj(x): return grad(self._laplace_neg_expected_log_joint, argnum=4)(data, input, mask, tag, x, Ez, Ezzp1, scale)
+            def _grad_obj(x): return grad(self._laplace_neg_expected_log_joint, argnum=5)(data, ix, input, mask, tag, x, Ez, Ezzp1, scale)
             def _hess_obj(x): return self._laplace_hessian_neg_expected_log_joint(x=x, **kwargs)
 
             if continuous_optimizer == "newton":
@@ -555,7 +568,7 @@ class SLDS(object):
             assert np.all(np.isfinite(_objective(x, -1)))
 
             J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs = self.\
-                _laplace_neg_hessian_params(data, input, mask, tag, x, Ez, Ezzp1)
+                _laplace_neg_hessian_params(data, ix, input, mask, tag, x, Ez, Ezzp1)
             h_ini, h_dyn_1, h_dyn_2, h_obs = \
                 self._laplace_neg_hessian_params_to_hs(x, J_ini, J_dyn_11,
                                               J_dyn_21, J_dyn_22, J_obs)
@@ -646,15 +659,18 @@ class SLDS(object):
                 # log p(theta)
                 exp_log_joint += self.log_prior()
 
-                for x, (Ez, Ezzp1, _), data, input, mask, tag in \
-                    zip(continuous_samples, discrete_expectations, datas, inputs, masks, tags):
+                for i, (x, (Ez, Ezzp1, _), data, input, mask, tag) in \
+                    enumerate(zip(continuous_samples, discrete_expectations, datas, inputs, masks, tags)):
 
                     # The "mask" for x is all ones
                     x_mask = np.ones_like(x, dtype=bool)
                     log_pi0 = self.init_state_distn.log_initial_state_distn
                     log_Ps = self.transitions.log_transition_matrices(x, input, x_mask, tag)
                     log_likes = self.dynamics.log_likelihoods(x, input, x_mask, tag)
-                    log_likes += self.emissions.log_likelihoods(data, input, mask, tag, x)
+                    if isinstance(self.emissions, ssm.emissions.MultiplePoissonEmissions):
+                        log_likes += self.emissions.log_likelihoods(data, i, input, mask, tag, x)
+                    else:
+                        log_likes += self.emissions.log_likelihoods(data, input, mask, tag, x)
 
                     # Compute the expected log probability
                     exp_log_joint += np.sum(Ez[0] * log_pi0)
