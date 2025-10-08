@@ -287,11 +287,14 @@ class SLDS(object):
         return hmm_expected_states(pi0, Ps, log_likes)
 
     @ensure_slds_args_not_none
-    def most_likely_states(self, variational_mean, data, input=None, mask=None, tag=None):
+    def most_likely_states(self, variational_mean, data, input=None, ix=None, mask=None, tag=None):
         pi0 = self.init_state_distn.initial_state_distn
         Ps = self.transitions.transition_matrices(variational_mean, input, mask, tag)
         log_likes = self.dynamics.log_likelihoods(variational_mean, input, np.ones_like(variational_mean, dtype=bool), tag)
-        log_likes += self.emissions.log_likelihoods(data, input, mask, tag, variational_mean)
+        if ix is None:
+            log_likes += self.emissions.log_likelihoods(data, input, mask, tag, variational_mean)
+        else:
+            log_likes += self.emissions.log_likelihoods(data, ix, input, mask, tag, variational_mean)
         return viterbi(pi0, Ps, log_likes)
 
     @ensure_slds_args_not_none
