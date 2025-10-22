@@ -63,7 +63,7 @@ class Observations(object):
     def log_prior(self):
         return 0
 
-    def log_likelihoods(self, data, input, mask, tag):
+    def log_likelihoods(self, data, ix, input, mask, tag):
         raise NotImplementedError
 
     def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
@@ -79,9 +79,9 @@ class Observations(object):
         # expected log joint
         def _expected_log_joint(expectations):
             elbo = self.log_prior()
-            for data, input, mask, tag, (expected_states, _, _) \
-                in zip(datas, inputs, masks, tags, expectations):
-                lls = self.log_likelihoods(data, input, mask, tag)
+            for ix, (data, input, mask, tag, (expected_states, _, _)) \
+                in enumerate(zip(datas, inputs, masks, tags, expectations)):
+                lls = self.log_likelihoods(data, ix, input, mask, tag)
                 elbo += np.sum(expected_states * lls)
             return elbo
 
@@ -840,10 +840,9 @@ class _AutoRegressiveObservationsBase(Observations):
         self.lags = lags
         self.bs = npr.randn(K, D)
 
-        # for now, only do multi-session for one phase
-        if K > 1 and session_ids is not None:
-            raise NotImplementedError("Can only do multi-session when there is one phase")
+        # doing multi session
         if session_ids is not None:
+            self._multi_session = True
             # parse my session_ids
             if not all(isinstance(session, int) for session in session_ids):
                 raise ValueError("All session_ids must be an integer")
@@ -853,9 +852,10 @@ class _AutoRegressiveObservationsBase(Observations):
             if self._num_sessions == 1:
                 raise ValueError("Only one unique session")
             # make multiple B matrices, one for each session
-            self.Vs = npr.randn(self._num_sessions, D, M)
+            self._Vs = npr.randn(self._num_sessions, K, D, M)
         else:
-            self.Vs = npr.randn(K, D, M)
+            self._multi_session = False
+            self._Vs = npr.randn(K, D, M)
 
         # Inheriting classes may treat _As differently
         self._As = None
@@ -866,29 +866,46 @@ class _AutoRegressiveObservationsBase(Observations):
 
     @As.setter
     def As(self, value):
+        if value.shape != (self.K, self.D, self.D):
+            raise ValueError("As array must have shape (K, D, D)")
         self._As = value
 
     @property
-    def Bs(self):
-        return self.Vs
+    def Vs(self):
+        return self._Vs
 
-    # @property
-    # def num_sessions(self) -> int:
-    #     """Return number of sessions."""
-    #     return self._num_sessions
-    #
-    # @property
-    # def session_ids(self):
-    #     """Return list of session ids."""
-    #     return self._session_ids
+    @Vs.setter
+    def Vs(self, value):
+        K, D, M = self.K, self.D, self.M
+        if self._multi_session:
+            if value.shape != (self.num_sessions, self.K, self.D, self.M):
+                raise ValueError("Multi-session observations require a shape of (num_sessions, K, D, M)")
+        else:
+            if value.shape != (self.K, self.D, self.M):
+                raise ValueError("B matrix must be of shape of (K, D, M)")
+        self._Vs = value
+
+    @property
+    def num_sessions(self):
+        """Return number of sessions."""
+        if self._multi_session:
+            return self._num_sessions
+        return None
+
+    @property
+    def session_ids(self):
+        """Return list of session ids."""
+        if self._multi_session:
+            return self._session_ids
+        return None
 
     @property
     def params(self):
         return self.As, self.bs, self.Vs
 
-    @params.setter
-    def params(self, value):
-        self.As, self.bs, self.Vs = value
+    # @params.setter
+    # def params(self, value):
+    #     self.As, self.bs, self.Vs = value
 
     def permute(self, perm):
         self.mu_init = self.mu_init[perm]
@@ -896,11 +913,15 @@ class _AutoRegressiveObservationsBase(Observations):
         self.bs = self.bs[perm]
         self.Vs = self.Vs[perm]
 
-    def _compute_mus(self, data, input, mask, tag):
+    def _compute_mus(self, data, ix, input, mask, tag):
         # assert np.all(mask), "ARHMM cannot handle missing data"
         K, M = self.K, self.M
         T, D = data.shape
-        As, bs, Vs, mu0s = self.As, self.bs, self.Vs, self.mu_init
+
+        if self._multi_session:
+            As, bs, Vs, mu0s = self.As, self.bs, self.Vs[self.session_ids[ix]], self.mu_init
+        else:
+            As, bs, Vs, mu0s = self.As, self.bs, self.Vs, self.mu_init
 
         # Instantaneous inputs
         mus = np.empty((K, T, D))
@@ -1026,10 +1047,10 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
         super(AutoRegressiveObservations, self).permute(perm)
         self._sqrt_Sigmas = self._sqrt_Sigmas[perm]
 
-    def log_likelihoods(self, data, input, mask, tag=None):
+    def log_likelihoods(self, data, ix, input, mask, tag=None):
         assert np.all(mask), "Cannot compute likelihood of autoregressive obsevations with missing data."
         L = self.lags
-        mus = self._compute_mus(data, input, mask, tag)
+        mus = self._compute_mus(data, ix, input, mask, tag)
 
         # Compute the likelihood of the initial data and remainder separately
         # stats.multivariate_studentst_logpdf supports broadcasting, but we get
@@ -1140,6 +1161,68 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
         return ExuxuTs, ExuyTs, EyyTs, Ens
 
+
+    def _multi_session_mstep(self, expectations, datas, inputs, masks, tags,
+               continuous_expectations=None, **kwargs):
+        K, D, M, lags = self.K, self.D, self.M, self.lags
+        # get all the data by each session and solve the linear regression for each session
+        # then get the Ks
+        # Solve the linear regressions
+        As = list()
+        Vs = np.zeros((self.num_sessions, K, D, M))
+        bs = list()
+        Sigmas = list()
+
+        for i in range(self.num_sessions):
+            ixs = np.where(self.session_ids == i)[0]
+            d = [datas[j] for j in ixs]
+            puts = [inputs[j] for j in ixs]
+            exps = [expectations[j] for j in ixs]
+
+            # Collect sufficient statistics
+            if continuous_expectations is None:
+                ExuxuTs, ExuyTs, EyyTs, Ens = self._get_sufficient_statistics(exps, d, puts)
+            else:
+                c_exps = [continuous_expectations[j] for j in ixs]
+                ExuxuTs, ExuyTs, EyyTs, Ens = \
+                    self._extend_given_sufficient_statistics(exps, c_exps, puts)
+
+            A_i = np.zeros((K, D, D * lags))
+            b_i = np.zeros((K, D))
+            Sigmas_i = np.zeros((K, D, D))
+
+            for k in range(K):
+                Wk = np.linalg.solve(ExuxuTs[k] + self.J0[k], ExuyTs[k] + self.h0[k]).T
+                A_i[k] = Wk[:, :D * lags]
+                Vs[i][k] = Wk[:, D * lags:-1]
+                b_i[k] = Wk[:, -1]
+                # Solve for the MAP estimate of the covariance
+                EWxyT = Wk @ ExuyTs[k]
+                sqerr = EyyTs[k] - EWxyT.T - EWxyT + Wk @ ExuxuTs[k] @ Wk.T
+                nu = self.nu0 + Ens[k]
+                Sigmas_i[k] = (sqerr + self.Psi0) / (nu + D + 1)
+
+            As.append(A_i)
+            bs.append(b_i)
+            Sigmas.append(Sigmas_i)
+
+            # If any states are unused, set their parameters to a perturbation of a used state
+            unused = np.where(Ens < 1)[0]
+            used = np.where(Ens > 1)[0]
+            if len(unused) > 0:
+                for k in unused:
+                    q = npr.choice(used)
+                    A_i[k] = A_i[q] + 0.01 * npr.randn(*A_i[q].shape)
+                    Vs[i][k] = Vs[i][q] + 0.01 * npr.randn(*Vs[i][q].shape)
+                    b_i[k] = b_i[q] + 0.01 * npr.randn(*b_i[q].shape)
+                    Sigmas_i[k] = Sigmas_i[q]
+
+            # Update parameters via their setter
+            self.As = np.mean(np.array(As), axis=0)
+            self.Vs = Vs
+            self.bs = np.mean(np.array(bs), axis=0)
+            self.Sigmas = np.mean(np.array(Sigmas), axis=0)
+
     def m_step(self, expectations, datas, inputs, masks, tags,
                continuous_expectations=None, **kwargs):
         """Compute M-step for Gaussian Auto Regressive Observations.
@@ -1156,6 +1239,10 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
         states from the posterior distribution.
         """
         K, D, M, lags = self.K, self.D, self.M, self.lags
+
+        if self._multi_session:
+            self._multi_session_mstep(expectations, datas, inputs, masks, tags, continuous_expectations=None, **kwargs)
+            return
 
         # Collect sufficient statistics
         if continuous_expectations is None:
@@ -1174,7 +1261,7 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
             As[k] = Wk[:, :D * lags]
             Vs[k] = Wk[:, D * lags:-1]
             bs[k] = Wk[:, -1]
-
+            bah = 0
             # Solve for the MAP estimate of the covariance
             EWxyT =  Wk @ ExuyTs[k]
             sqerr = EyyTs[k] - EWxyT.T - EWxyT + Wk @ ExuxuTs[k] @ Wk.T
@@ -1339,11 +1426,11 @@ class AutoRegressiveDiagonalNoiseObservations(AutoRegressiveObservations):
         self._log_sigmasq_init = self._log_sigmasq_init[perm]
         self._log_sigmasq = self._log_sigmasq[perm]
 
-    def log_likelihoods(self, data, input, mask, tag):
+    def log_likelihoods(self, data, ix, input, mask, tag):
         assert np.all(mask), "Cannot compute likelihood of autoregressive obsevations with missing data."
 
         L = self.lags
-        mus = self._compute_mus(data, input, mask, tag)
+        mus = self._compute_mus(data, ix, input, mask, tag)
 
         # Compute the likelihood of the initial data and remainder separately
         # stats.multivariate_studentst_logpdf supports broadcasting, but we get

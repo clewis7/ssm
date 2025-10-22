@@ -251,10 +251,10 @@ class HMM(object):
             return z[pad:], data[pad:]
 
     @ensure_args_not_none
-    def expected_states(self, data, input=None, mask=None, tag=None):
+    def expected_states(self, data, ix, input=None, mask=None, tag=None):
         pi0 = self.init_state_distn.initial_state_distn
         Ps = self.transitions.transition_matrices(data, input, mask, tag)
-        log_likes = self.observations.log_likelihoods(data, input, mask, tag)
+        log_likes = self.observations.log_likelihoods(data, ix, input, mask, tag)
         return hmm_expected_states(pi0, Ps, log_likes)
 
     @ensure_args_not_none
@@ -298,10 +298,10 @@ class HMM(object):
         :return total log probability of the data.
         """
         ll = 0
-        for data, input, mask, tag in zip(datas, inputs, masks, tags):
+        for ix, (data, input, mask, tag) in enumerate(zip(datas, inputs, masks, tags)):
             pi0 = self.init_state_distn.initial_state_distn
             Ps = self.transitions.transition_matrices(data, input, mask, tag)
-            log_likes = self.observations.log_likelihoods(data, input, mask, tag)
+            log_likes = self.observations.log_likelihoods(data, ix, input, mask, tag)
             ll += hmm_normalizer(pi0, Ps, log_likes)
             assert np.isfinite(ll)
         return ll
@@ -446,9 +446,9 @@ class HMM(object):
 
         for itr in pbar:
             # E step: compute expected latent states with current parameters
-            expectations = [self.expected_states(data, input, mask, tag)
-                            for data, input, mask, tag,
-                            in zip(datas, inputs, masks, tags)]
+            expectations = [self.expected_states(data, ix, input, mask, tag)
+                            for ix, (data, input, mask, tag),
+                            in enumerate(zip(datas, inputs, masks, tags))]
 
             # M step: maximize expected log joint wrt parameters
             self.init_state_distn.m_step(expectations, datas, inputs, masks, tags, **init_state_mstep_kwargs)

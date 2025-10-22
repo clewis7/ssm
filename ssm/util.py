@@ -147,7 +147,7 @@ def ensure_variational_args_are_lists(f):
 
 
 def ensure_args_not_none(f):
-    def wrapper(self, data, input=None, mask=None, tag=None, **kwargs):
+    def wrapper(self, data, ix=None, input=None, mask=None, tag=None, **kwargs):
         assert data is not None
 
         M = (self.M,) if isinstance(self.M, int) else self.M
@@ -155,7 +155,7 @@ def ensure_args_not_none(f):
         input = np.zeros((data.shape[0],) + M) if input is None else input
 
         mask = np.ones_like(data, dtype=bool) if mask is None else mask
-        return f(self, data, input=input, mask=mask, tag=tag, **kwargs)
+        return f(self, data, ix=ix, input=input, mask=mask, tag=tag, **kwargs)
     return wrapper
 
 
