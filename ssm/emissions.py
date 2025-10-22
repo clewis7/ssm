@@ -109,13 +109,16 @@ class _LinearEmissions(Emissions):
     where C is an emission matrix, d is a bias, F an input matrix,
     and u is an input.
     """
-    def __init__(self, N, K, D, M=0, single_subspace=True):
+    def __init__(self, N, K, D, M=0, single_subspace=True, fit_F=False):
         super(_LinearEmissions, self).__init__(N, K, D, M=M, single_subspace=single_subspace)
-
+        self._fit_F = fit_F
         # Initialize linear layer.  Set _Cs to be private so that it can be
         # changed in subclasses.
         self._Cs = npr.randn(1, N, D) if single_subspace else npr.randn(K, N, D)
-        self.Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        if self._fit_F:
+            self._Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        else:
+            self._Fs = np.zeros((1, N, M)) if single_subspace else np.zeros((K, N, M))
         self.ds = npr.randn(1, N) if single_subspace else npr.randn(K, N)
 
     @property
@@ -127,6 +130,15 @@ class _LinearEmissions(Emissions):
         K, N, D = self.K, self.N, self.D
         assert value.shape == (1, N, D) if self.single_subspace else (K, N, D)
         self._Cs = value
+
+    @property
+    def Fs(self):
+        return self._Fs
+
+    @Fs.setter
+    def Fs(self, value):
+        if self._fit_F:
+            self._Fs = value
 
     @property
     def params(self):
@@ -751,6 +763,7 @@ class MultiplePoissonEmissions(Emissions):
                  D,
                  M=0,
                  single_subspace=True,
+                 fit_F=False,
                  **kwargs):
 
         """
@@ -758,6 +771,7 @@ class MultiplePoissonEmissions(Emissions):
         per session.
         """
         super(MultiplePoissonEmissions, self).__init__(N, K, D, M=M, single_subspace=single_subspace)
+        self._fit_F = fit_F
 
         if "session_ids" not in kwargs:
             raise ValueError("MultiplePoissonEmissions requires session_ids to be provided.")
@@ -773,7 +787,10 @@ class MultiplePoissonEmissions(Emissions):
             raise ValueError("Only one unique session, use regular PoissonEmissions.")
         # make multiple C matrices, one for each session
         self._Cs = npr.randn(self._num_sessions, N, D) if single_subspace else npr.randn(K, N, D)
-        self.Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        if self._fit_F:
+            self._Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        else:
+            self._Fs = np.zeros((1, N, M)) if single_subspace else np.zeros((K, N, M))
         self.ds = npr.randn(1, N) if single_subspace else npr.randn(K, N)
 
         if "link" not in kwargs:
@@ -807,6 +824,15 @@ class MultiplePoissonEmissions(Emissions):
         K, N, D = self.K, self.N, self.D
         assert value.shape == (self._num_sessions, N, D) if self.single_subspace else (K, N, D)
         self._Cs = value
+
+    @property
+    def Fs(self):
+        return self._Fs
+
+    @Fs.setter
+    def Fs(self, value):
+        if self._fit_F:
+            self._Fs = value
 
     @property
     def num_sessions(self) -> int:
