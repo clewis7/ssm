@@ -829,7 +829,7 @@ class _AutoRegressiveObservationsBase(Observations):
 
     where L is the number of lags and u_t is the input.
     """
-    def __init__(self, K, D, M=0, lags=1):
+    def __init__(self, K, D, M=0, lags=1, session_ids=None):
         super(_AutoRegressiveObservationsBase, self).__init__(K, D, M)
 
         # Distribution over initial point
@@ -839,7 +839,23 @@ class _AutoRegressiveObservationsBase(Observations):
         assert lags > 0
         self.lags = lags
         self.bs = npr.randn(K, D)
-        self.Vs = npr.randn(K, D, M)
+
+        # for now, only do multi-session for one phase
+        if K > 1 and session_ids is not None:
+            raise NotImplementedError("Can only do multi-session when there is one phase")
+        if session_ids is not None:
+            # parse my session_ids
+            if not all(isinstance(session, int) for session in session_ids):
+                raise ValueError("All session_ids must be an integer")
+            self._session_ids = np.array(session_ids)
+            # get the number of unique session ids
+            self._num_sessions = np.unique(self._session_ids).shape[0]
+            if self._num_sessions == 1:
+                raise ValueError("Only one unique session")
+            # make multiple B matrices, one for each session
+            self.Vs = npr.randn(self._num_sessions, D, M)
+        else:
+            self.Vs = npr.randn(K, D, M)
 
         # Inheriting classes may treat _As differently
         self._As = None
@@ -851,6 +867,20 @@ class _AutoRegressiveObservationsBase(Observations):
     @As.setter
     def As(self, value):
         self._As = value
+
+    @property
+    def Bs(self):
+        return self.Vs
+
+    # @property
+    # def num_sessions(self) -> int:
+    #     """Return number of sessions."""
+    #     return self._num_sessions
+    #
+    # @property
+    # def session_ids(self):
+    #     """Return list of session ids."""
+    #     return self._session_ids
 
     @property
     def params(self):
@@ -916,9 +946,9 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
                  l2_penalty_A=1e-8,
                  l2_penalty_b=1e-8,
                  l2_penalty_V=1e-8,
-                 nu0=1e-4, Psi0=1e-4):
+                 nu0=1e-4, Psi0=1e-4, **kwargs):
         super(AutoRegressiveObservations, self).\
-            __init__(K, D, M, lags=lags)
+            __init__(K, D, M, lags=lags, **kwargs)
 
         # Initialize the dynamics and the noise covariances
         self._As = .80 * np.array([
@@ -1239,13 +1269,15 @@ class AutoRegressiveDiagonalNoiseObservations(AutoRegressiveObservations):
     def __init__(self, K, D, M=0, lags=1,
                  l2_penalty_A=1e-8,
                  l2_penalty_b=1e-8,
-                 l2_penalty_V=1e-8):
+                 l2_penalty_V=1e-8,
+                 **kwargs):
 
         super(AutoRegressiveDiagonalNoiseObservations, self).\
             __init__(K, D, M, lags=lags,
                      l2_penalty_A=l2_penalty_A,
                      l2_penalty_b=l2_penalty_b,
-                     l2_penalty_V=l2_penalty_V)
+                     l2_penalty_V=l2_penalty_V,
+                     **kwargs)
 
         # Initialize the dynamics and the noise covariances
         self._As = .80 * np.array([
