@@ -1,0 +1,45 @@
+[build-system]
+requires = [
+    "setuptools>=65",
+    "wheel",
+    "cython",
+    "numpy",
+    "tqdm",
+    "autograd",
+    "numba",
+    "scikit-learn"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssm"
+version = "0.0.1"
+description = "Bayesian learning and inference for a variety of state space models"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.7"
+
+authors = [
+    { name = "Scott Linderman", email = "scott.linderman@stanford.edu" }
+]
+
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: Software Development",
+    "Topic :: Scientific/Engineering",
+    "Operating System :: POSIX",
+    "Operating System :: Unix",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[tool.setuptools]
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["."]
