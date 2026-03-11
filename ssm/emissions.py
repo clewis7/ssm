@@ -1,4 +1,5 @@
 from warnings import warn
+from typing import List, Tuple
 
 import autograd.numpy as np
 import autograd.numpy.random as npr
@@ -108,13 +109,16 @@ class _LinearEmissions(Emissions):
     where C is an emission matrix, d is a bias, F an input matrix,
     and u is an input.
     """
-    def __init__(self, N, K, D, M=0, single_subspace=True):
+    def __init__(self, N, K, D, M=0, single_subspace=True, fit_F=False):
         super(_LinearEmissions, self).__init__(N, K, D, M=M, single_subspace=single_subspace)
-
+        self._fit_F = fit_F
         # Initialize linear layer.  Set _Cs to be private so that it can be
         # changed in subclasses.
         self._Cs = npr.randn(1, N, D) if single_subspace else npr.randn(K, N, D)
-        self.Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        if self._fit_F:
+            self._Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        else:
+            self._Fs = np.zeros((1, N, M)) if single_subspace else np.zeros((K, N, M))
         self.ds = npr.randn(1, N) if single_subspace else npr.randn(K, N)
 
     @property
@@ -126,6 +130,15 @@ class _LinearEmissions(Emissions):
         K, N, D = self.K, self.N, self.D
         assert value.shape == (1, N, D) if self.single_subspace else (K, N, D)
         self._Cs = value
+
+    @property
+    def Fs(self):
+        return self._Fs
+
+    @Fs.setter
+    def Fs(self, value):
+        if self._fit_F:
+            self._Fs = value
 
     @property
     def params(self):
@@ -742,6 +755,275 @@ class PoissonEmissions(_PoissonEmissionsMixin, _LinearEmissions):
 
         else:
             raise Exception("No Hessian calculation for link: {}".format(self.link_name))
+
+class MultiplePoissonEmissions(Emissions):
+    def __init__(self,
+                 N,
+                 K,
+                 D,
+                 M=0,
+                 single_subspace=True,
+                 fit_F=False,
+                 **kwargs):
+
+        """
+        Fitting Poisson observations for different recording sessions. A method to align across days. One C matrix
+        per session.
+        """
+        super(MultiplePoissonEmissions, self).__init__(N, K, D, M=M, single_subspace=single_subspace)
+        self._fit_F = fit_F
+
+        if "session_ids" not in kwargs:
+            raise ValueError("MultiplePoissonEmissions requires session_ids to be provided.")
+            # validate session ids as a list of int
+        if not all(isinstance(session, int) for session in kwargs["session_ids"]):
+            raise ValueError("All session_ids must be an integer")
+
+        self._session_ids = np.array(kwargs["session_ids"])
+
+        # get the number of unique session ids
+        self._num_sessions = np.unique(self._session_ids).shape[0]
+        if self._num_sessions == 1:
+            raise ValueError("Only one unique session, use regular PoissonEmissions.")
+        # make multiple C matrices, one for each session
+        self._Cs = npr.randn(self._num_sessions, N, D) if single_subspace else npr.randn(K, N, D)
+        if self._fit_F:
+            self._Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        else:
+            self._Fs = np.zeros((1, N, M)) if single_subspace else np.zeros((K, N, M))
+        self.ds = npr.randn(1, N) if single_subspace else npr.randn(K, N)
+
+        if "link" not in kwargs:
+            link = "softplus"
+        else:
+            link = kwargs["link"]
+        if "bin_size" not in kwargs:
+            bin_size = 1.0
+        else:
+            bin_size = kwargs["bin_size"]
+
+        self.link_name = link
+        self.bin_size = bin_size
+        mean_functions = dict(
+            log=self._log_mean,
+            softplus=self._softplus_mean
+        )
+        self.mean = mean_functions[link]
+        link_functions = dict(
+            log=self._log_link,
+            softplus=self._softplus_link
+        )
+        self.link = link_functions[link]
+
+    @property
+    def Cs(self):
+        return self._Cs
+
+    @Cs.setter
+    def Cs(self, value):
+        K, N, D = self.K, self.N, self.D
+        assert value.shape == (self._num_sessions, N, D) if self.single_subspace else (K, N, D)
+        self._Cs = value
+
+    @property
+    def Fs(self):
+        return self._Fs
+
+    @Fs.setter
+    def Fs(self, value):
+        if self._fit_F:
+            self._Fs = value
+
+    @property
+    def num_sessions(self) -> int:
+        """Return number of sessions."""
+        return self._num_sessions
+
+    @property
+    def session_ids(self) -> List[int]:
+        """Return list of session ids."""
+        return self._session_ids
+
+    @property
+    def params(self):
+        return self.Cs, self.Fs, self.ds
+
+    @params.setter
+    def params(self, value):
+        self.Cs, self.Fs, self.ds = value
+
+    @ensure_args_are_lists
+    def initialize(self, datas, inputs=None, masks=None, tags=None):
+        datas = [interpolate_data(data, mask) for data, mask in zip(datas, masks)]
+        yhats = [self.link(np.clip(d, .1, np.inf)) for d in datas]
+        self._initialize_with_pca(yhats, inputs=inputs, masks=masks, tags=tags)
+
+    @ensure_args_are_lists
+    def _initialize_with_pca(self, datas, inputs=None, masks=None, tags=None, num_iters=20):
+        Keff = 1 if self.single_subspace else self.K
+
+        _Cs = list()
+        _ds = list()
+
+        # want to run this for each C
+        for i in range(self.num_sessions):
+            # get all the datas for that session id
+            idxs = np.where(self.session_ids == i)[0]
+            _datas = [datas[i] for i in idxs]
+            _inputs = [inputs[i] for i in idxs]
+            _masks = [masks[i] for i in idxs]
+
+            # First solve a linear regression for data given input
+            if self.M > 0:
+                from sklearn.linear_model import LinearRegression
+                lr = LinearRegression(fit_intercept=False)
+                lr.fit(np.vstack(_inputs), np.vstack(_datas))
+                self.Fs = np.tile(lr.coef_[None, :, :], (Keff, 1, 1))
+
+            # Compute residual after accounting for input
+            resids = [data - np.dot(input, self.Fs[0].T) for data, input in zip(_datas, _inputs)]
+
+            # Run PCA to get a linear embedding of the data with the maximum effective dimension
+            # need to also get masks for each trial
+            pca, xs, ll = pca_with_imputation(min(self.D * Keff, self.N),
+                                              resids, _masks, num_iters=num_iters)
+
+            # Assign each state a random projection of these dimensions
+            Cs, ds = [], []
+            for k in range(Keff):
+                weights = npr.randn(self.D, self.D * Keff)
+                weights = np.linalg.svd(weights, full_matrices=False)[2]
+                Cs.append((weights @ pca.components_).T)
+                ds.append(pca.mean_)
+            _Cs.append(np.array(Cs))
+            _ds.append(np.array(ds))
+
+        # Find the components with the largest power
+        self.Cs = np.vstack(_Cs)
+        self.ds = np.mean(_ds, axis=0)
+
+        return pca
+
+    def _log_mean(self, x):
+        return np.exp(x) * self.bin_size
+
+    def _softplus_mean(self, x):
+        return softplus(x) * self.bin_size
+
+    def _log_link(self, rate):
+        return np.log(rate) - np.log(self.bin_size)
+
+    def _softplus_link(self, rate):
+        return inv_softplus(rate / self.bin_size)
+
+    def log_likelihoods(self, data, index, input, mask, tag, x):
+        assert data.dtype == int
+        lambdas = self.mean(self.forward(x, index, input, tag))
+        mask = np.ones_like(data, dtype=bool) if mask is None else mask
+        lls = -gammaln(data[:,None,:] + 1) -lambdas + data[:,None,:] * np.log(lambdas)
+        return np.sum(lls * mask[:, None, :], axis=2)
+
+    def invert(self, data, index, input=None, mask=None, tag=None):
+        yhat = self.link(np.clip(data, .1, np.inf))
+        return self._invert(yhat, index=index, input=input, mask=mask, tag=tag)
+
+    def _invert(self, data, index, input=None, mask=None, tag=None):
+        """
+        Approximate invert the linear emission model with the pseudoinverse
+
+        y = Cx + d + noise; C orthogonal.
+        xhat = (C^T C)^{-1} C^T (y-d)
+        """
+        session_id = self.session_ids[index]
+        # Invert with the average emission parameters
+        C = np.mean(self.Cs[session_id].reshape(1, self.N, self.D), axis=0)
+        F = np.mean(self.Fs, axis=0)
+        d = np.mean(self.ds, axis=0)
+        C_pseudoinv = np.linalg.solve(C.T.dot(C), C.T).T
+
+        # Account for the bias
+        bias = input.dot(F.T) + d
+
+        if not np.all(mask):
+            data = interpolate_data(data, mask)
+            # We would like to find the PCA coordinates in the face of missing data
+            # To do so, alternate between running PCA and imputing the missing entries
+            for itr in range(25):
+                mu = (data - bias).dot(C_pseudoinv)
+                data[:, ~mask[0]] = (mu.dot(C.T) + bias)[:, ~mask[0]]
+
+        # Project data to get the mean
+        return (data - bias).dot(C_pseudoinv)
+
+    def forward(self, x, index, input, tag):
+        session_id = self.session_ids[index]
+        C = self.Cs[session_id].reshape(1, self.N, self.D)
+        return np.matmul(C[None, ...], x[:, None, :, None])[:, :, :, 0] \
+            + np.matmul(self.Fs[None, ...], input[:, None, :, None])[:, :, :, 0] \
+            + self.ds
+
+    def neg_hessian_log_emissions_prob(self, data, ix, input, mask, tag, x, Ez):
+        """
+        d/dx log p(y | x) = d/dx [y * (Cx + Fu + d) - exp(Cx + Fu + d)
+                          = y * C - lmbda * C
+                          = (y - lmbda) * C
+
+        d/dx  (y - lmbda)^T C = d/dx -exp(Cx + Fu + d)^T C
+            = -C^T exp(Cx + Fu + d)^T C
+        """
+        if self.single_subspace is False:
+            raise Exception("Multiple subspaces are not supported for this Emissions class.")
+
+        session_id = self.session_ids[ix]
+        C = self.Cs[session_id]
+
+        if self.link_name == "log":
+            lambdas = self.mean(self.forward(x, input, tag))
+            hess = np.einsum('tn, ni, nj ->tij', -lambdas[:, 0, :], C[0], C[0])
+            return -1 * hess
+
+        elif self.link_name == "softplus":
+            # For stability, we avoid evaluating terms that look like exp(x)**2.
+            # Instead, we rearrange things so that all terms with exp(x)**2 are of the form
+            # (exp(x) / exp(x)**2) which evaluates to sigmoid(x)sigmoid(-x) and avoids overflow.
+            lambdas = self.mean(self.forward(x, ix, input, tag))[:, 0, :] / self.bin_size
+            linear_terms = -np.dot(x,C.T)-np.dot(input,self.Fs[0].T)-self.ds[0]
+            expterms = np.exp(linear_terms)
+            outer = logistic(linear_terms) * logistic(-linear_terms)
+            diags = outer * (data / lambdas - data / (lambdas**2 * expterms) - self.bin_size)
+            hess = np.einsum('tn, ni, nj ->tij', diags, C, C)
+            return -hess
+
+        else:
+            raise Exception("No Hessian calculation for link: {}".format(self.link_name))
+
+
+    def m_step(self, discrete_expectations, continuous_expectations,
+               datas, inputs, masks, tags,
+               optimizer="bfgs", maxiter=100, **kwargs):
+        """
+        If M-step in Laplace-EM cannot be done in closed form for the emissions, default to SGD.
+        """
+        optimizer = dict(adam=adam, bfgs=bfgs, lbfgs=lbfgs, rmsprop=rmsprop, sgd=sgd)[optimizer]
+
+        # expected log likelihood
+        T = sum([data.shape[0] for data in datas])
+        def _objective(params, itr):
+            self.params = params
+            obj = 0
+            obj += self.log_prior()
+            for ix, (data, input, mask, tag, x, (Ez, _, _))in \
+                enumerate(zip(datas, inputs, masks, tags, continuous_expectations, discrete_expectations)):
+                obj += np.sum(Ez * self.log_likelihoods(data, ix, input, mask, tag, x))
+            return -obj / T
+
+        # Optimize emissions log-likelihood
+        self.params = optimizer(_objective, self.params,
+                                num_iters=maxiter,
+                                suppress_warnings=True,
+                                **kwargs)
+
+
 
 
 class PoissonOrthogonalEmissions(_PoissonEmissionsMixin, _OrthogonalLinearEmissions):

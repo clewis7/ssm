@@ -1,6 +1,7 @@
 import autograd.numpy as np
 import autograd.numpy.random as npr
 
+import ssm.emissions
 from ssm.primitives import lds_log_probability, lds_sample, lds_mean
 from ssm.messages import hmm_expected_states, hmm_sample, kalman_info_sample, kalman_info_smoother
 
@@ -274,8 +275,8 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
         self._continuous_state_params = None
         self._continuous_expectations = None
         self.continuous_state_params = \
-            [self._initialize_continuous_state_params(data, input, mask, tag)
-             for data, input, mask, tag in zip(datas, inputs, masks, tags)]
+            [self._initialize_continuous_state_params(data, ix, input, mask, tag)
+             for ix, (data, input, mask, tag) in enumerate(zip(datas, inputs, masks, tags))]
 
     # Parameters
     @property
@@ -331,7 +332,7 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
         log_likes = np.zeros((T, K))
         return dict(pi0=pi0, Ps=Ps, log_likes=log_likes)
 
-    def _initialize_continuous_state_params(self, data, input, mask, tag):
+    def _initialize_continuous_state_params(self, data, ix, input, mask, tag):
         T = data.shape[0]
         D = self.D
 
@@ -342,8 +343,12 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
 
         # Set the posterior mean based on the emission model, if possible.
         try:
-            h_obs = (1.0 / self.initial_variance) * self.model.emissions. \
-                invert(data, input=input, mask=mask, tag=tag)
+            if isinstance(self.model.emissions, ssm.emissions.MultiplePoissonEmissions):
+                h_obs = (1.0 / self.initial_variance) * self.model.emissions. \
+                    invert(data, index=ix, input=input, mask=mask, tag=tag)
+            else:
+                h_obs = (1.0 / self.initial_variance) * self.model.emissions. \
+                    invert(data, input=input, mask=mask, tag=tag)
         except:
             warn("We can only initialize the continuous states if the emissions support "
                  "\"inverting\" the observations by mapping them to an estimate of the "
