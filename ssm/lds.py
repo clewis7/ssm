@@ -290,7 +290,12 @@ class SLDS(object):
     def most_likely_states(self, variational_mean, data, input=None, ix=None, mask=None, tag=None):
         pi0 = self.init_state_distn.initial_state_distn
         Ps = self.transitions.transition_matrices(variational_mean, input, mask, tag)
-        log_likes = self.dynamics.log_likelihoods(variational_mean, input, np.ones_like(variational_mean, dtype=bool), tag)
+        if self.dynamics._multi_session:
+            log_likes = self.dynamics.log_likelihoods(variational_mean, ix, input,
+                                                      np.ones_like(variational_mean, dtype=bool), tag)
+        else:
+            log_likes = self.dynamics.log_likelihoods(variational_mean, None, input,
+                                                      np.ones_like(variational_mean, dtype=bool), tag)
         if ix is None:
             log_likes += self.emissions.log_likelihoods(data, input, mask, tag, variational_mean)
         else:
@@ -408,8 +413,8 @@ class SLDS(object):
         #    - Compute the expected log likelihoods (i.e. log dynamics probs)
         #    - If emissions depend on z, compute expected emission likelihoods
         discrete_state_params = []
-        for x_samples, data, input, mask, tag in \
-            zip(x_sampless, datas, inputs, masks, tags):
+        for ix, (x_samples, data, input, mask, tag) in \
+            enumerate(zip(x_sampless, datas, inputs, masks, tags)):
 
             # Make a mask for the continuous states
             x_mask = np.ones_like(x_samples[0], dtype=bool)
@@ -423,9 +428,14 @@ class SLDS(object):
                 [self.transitions.transition_matrices(x, input, x_mask, tag)
                  for x in x_samples], axis=0)
 
-            log_likes = np.mean(
-                [self.dynamics.log_likelihoods(x, input, x_mask, tag)
-                 for x in x_samples], axis=0)
+            if self.dynamics._multi_session:
+                log_likes = np.mean(
+                    [self.dynamics.log_likelihoods(x, ix, input, x_mask, tag)
+                     for x in x_samples], axis=0)
+            else:
+                log_likes = np.mean(
+                    [self.dynamics.log_likelihoods(x, None, input, x_mask, tag)
+                     for x in x_samples], axis=0)
 
             if not self.emissions.single_subspace:
                 log_likes += np.mean(
@@ -455,7 +465,7 @@ class SLDS(object):
         log_pi0 = self.init_state_distn.log_initial_state_distn
         log_Ps = self.transitions.\
             log_transition_matrices(x, input, x_mask, tag)
-        log_likes = self.dynamics.log_likelihoods(x, input, x_mask, tag)
+        log_likes = self.dynamics.log_likelihoods(x, ix, input, x_mask, tag)
         if isinstance(self.emissions, ssm.emissions.MultiplePoissonEmissions):
             log_likes += self.emissions.log_likelihoods(data, ix, input, mask, tag, x)
         else:
@@ -669,7 +679,7 @@ class SLDS(object):
                     x_mask = np.ones_like(x, dtype=bool)
                     log_pi0 = self.init_state_distn.log_initial_state_distn
                     log_Ps = self.transitions.log_transition_matrices(x, input, x_mask, tag)
-                    log_likes = self.dynamics.log_likelihoods(x, input, x_mask, tag)
+                    log_likes = self.dynamics.log_likelihoods(x, i, input, x_mask, tag)
                     if isinstance(self.emissions, ssm.emissions.MultiplePoissonEmissions):
                         log_likes += self.emissions.log_likelihoods(data, i, input, mask, tag, x)
                     else:
